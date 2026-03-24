@@ -50,6 +50,7 @@ from acp.schema import (
 )
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from langchain.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
@@ -73,6 +74,8 @@ from deepagents_acp.utils import (
     truncate_execute_command_for_display,
 )
 
+from .logger import Logger, UsageDetail
+
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionContext:
@@ -94,6 +97,7 @@ class AgentServerACP(ACPAgent):
         *,
         modes: SessionModeState | None = None,
         models: list[dict[str, str]] | None = None,
+        logger: Logger | None = None,
     ) -> None:
         """Initialize the ACP agent server with the given agent factory or compiled graph.
 
@@ -107,6 +111,7 @@ class AgentServerACP(ACPAgent):
         self._cwd = ""
         self._agent_factory = agent
         self._agent: CompiledStateGraph | None = None
+        self.logger = logger or Logger()
 
         if isinstance(agent, CompiledStateGraph):
             if modes is not None:
@@ -412,6 +417,7 @@ class AgentServerACP(ACPAgent):
         message_chunk: Any,
         active_tool_calls: dict,
         tool_call_accumulator: dict,
+        _metadata: Any,
     ) -> None:
         """Process tool call chunks and start tool calls when complete."""
         if (
@@ -457,6 +463,15 @@ class AgentServerACP(ACPAgent):
                             "name": tool_name,
                             "args": tool_args,
                         }
+
+                        if tool_name == "task":
+                            self.logger.on_agent_start(
+                                id=tool_id, name=tool_name, input=tool_args, metadata=_metadata
+                            )
+                        else:
+                            self.logger.on_tool_start(
+                                id=tool_id, name=tool_name, input=tool_args, metadata=_metadata
+                            )
 
                         # Create the appropriate tool call start
                         update = self._create_tool_call_start(tool_id, tool_name, tool_args)
@@ -625,17 +640,25 @@ class AgentServerACP(ACPAgent):
 
         current_state = None
         user_decisions = []
+        llm_output = ""
+
+        message = {"messages": [{"role": "user", "content": content_blocks}]}
+
+        self.logger.on_agent_start(
+            id=session_id, name="user-request", input={"prompt": prompt, "message": message}
+        )
 
         while current_state is None or current_state.interrupts:
             # Check for cancellation
             if self._cancelled:
                 self._cancelled = False  # Reset for next prompt
+                self.logger.on_agent_end(
+                    id=session_id, output=llm_output, metadata={"stop_reason": "cancelled"}
+                )
                 return PromptResponse(stop_reason="cancelled")
 
             async for stream_chunk in agent.astream(
-                Command(resume={"decisions": user_decisions})
-                if user_decisions
-                else {"messages": [{"role": "user", "content": content_blocks}]},
+                Command(resume={"decisions": user_decisions}) if user_decisions else message,
                 config=config,
                 stream_mode=["messages", "updates"],
                 subgraphs=True,
@@ -645,9 +668,13 @@ class AgentServerACP(ACPAgent):
                     continue
 
                 _namespace, stream_mode, data = stream_chunk
+
                 # Check for cancellation during streaming
                 if self._cancelled:
                     self._cancelled = False  # Reset for next prompt
+                    self.logger.on_agent_end(
+                        id=session_id, output=llm_output, metadata={"stop_reason": "cancelled"}
+                    )
                     return PromptResponse(stop_reason="cancelled")
 
                 if stream_mode == "updates":
@@ -684,10 +711,33 @@ class AgentServerACP(ACPAgent):
                             break
 
                     for node_name, update in updates.items():
-                        if node_name == "tools" and isinstance(update, dict) and "todos" in update:
-                            todos = update.get("todos", [])
-                            if todos:
-                                await self._handle_todo_update(session_id, todos, log_plan=False)
+                        if node_name == "tools":
+                            if isinstance(update, dict) and "todos" in update:
+                                todos = update.get("todos", [])
+                                if todos:
+                                    await self._handle_todo_update(
+                                        session_id, todos, log_plan=False
+                                    )
+                        elif node_name == "model":
+                            for msg in update.get("messages", []):
+                                if isinstance(msg, AIMessage):
+                                    llm_output += msg.content
+                                    self.logger.on_llm(
+                                        name=msg.name,
+                                        model=msg.response_metadata.get("model_name"),
+                                        output=msg.content,
+                                        metadata=msg.response_metadata,
+                                        usage_details=UsageDetail(
+                                            input=msg.usage_metadata.get("input_tokens", 0),
+                                            output=msg.usage_metadata.get("output_tokens", 0),
+                                            total=msg.usage_metadata.get("total_tokens", 0),
+                                            cache_read_input_tokens=msg.usage_metadata.get(
+                                                "input_token_details", {}
+                                            ).get("cache_read", 0),
+                                        ),
+                                    )
+                        else:
+                            self.logger.on_middleware(name=node_name, metadata=update)
 
                     continue
 
@@ -699,11 +749,13 @@ class AgentServerACP(ACPAgent):
                     message_chunk,
                     active_tool_calls,
                     tool_call_accumulator,
+                    _metadata,
                 )
 
                 if isinstance(message_chunk, str):
                     if not _namespace:
                         await self._log_text(text=message_chunk, session_id=session_id)
+
                 # Check for tool results (ToolMessage responses)
                 elif hasattr(message_chunk, "type") and message_chunk.type == "tool":
                     # This is a tool result message
@@ -727,6 +779,12 @@ class AgentServerACP(ACPAgent):
                             )
                         else:
                             formatted_content = str(content)
+
+                        if tool_name == "task":
+                            self.logger.on_agent_end(id=tool_call_id, output=str(content))
+                        else:
+                            self.logger.on_tool_end(id=tool_call_id, output=str(content))
+
                         update = update_tool_call(
                             tool_call_id=tool_call_id,
                             status="completed",
@@ -761,6 +819,10 @@ class AgentServerACP(ACPAgent):
             # Note: Interrupts are handled during streaming via __interrupt__ updates
             # This state check is only for the while loop condition
 
+        self.logger.on_agent_end(
+            id=session_id, output=llm_output, metadata={"stop_reason": "end_turn"}
+        )
+
         return PromptResponse(stop_reason="end_turn")
 
     async def _handle_interrupts(  # noqa: C901, PLR0912, PLR0915  # Complex HITL permission handling with many branches
@@ -778,11 +840,15 @@ class AgentServerACP(ACPAgent):
                 tool_call_id = interrupt.id
                 interrupt_value = interrupt.value
 
+                self.logger.on_interrupt_start(id=tool_call_id, input=interrupt_value)
+
                 # Extract action requests from interrupt_value
                 action_requests = []
                 if isinstance(interrupt_value, dict):
                     # Deep Agents wraps tool calls in action_requests
                     action_requests = interrupt_value.get("action_requests", [])
+
+                interrupt_decisions = []
 
                 # Process each action request
                 for action in action_requests:
@@ -802,7 +868,7 @@ class AgentServerACP(ACPAgent):
                                 # Plan is in progress, auto-approve updates
                                 # Store the updated plan (status and content may have changed)
                                 self._session_plans[session_id] = new_todos
-                                user_decisions.append({"type": "approve"})
+                                interrupt_decisions.append({"type": "approve"})
                                 continue
 
                     if session_id in self._allowed_command_types:
@@ -818,10 +884,10 @@ class AgentServerACP(ACPAgent):
                                 )
                                 if all_allowed:
                                     # Auto-approve this command
-                                    user_decisions.append({"type": "approve"})
+                                    interrupt_decisions.append({"type": "approve"})
                                     continue
                         elif (tool_name, None) in self._allowed_command_types[session_id]:
-                            user_decisions.append({"type": "approve"})
+                            interrupt_decisions.append({"type": "approve"})
                             continue
 
                     # Create a title for the permission request
@@ -910,10 +976,10 @@ class AgentServerACP(ACPAgent):
                             else:
                                 self._allowed_command_types[session_id].add((tool_name, None))
                             # Approve this command
-                            user_decisions.append({"type": "approve"})
+                            interrupt_decisions.append({"type": "approve"})
                         elif tool_name == "write_todos" and decision_type == "reject":
                             await self._clear_plan(session_id)
-                            user_decisions.append(
+                            interrupt_decisions.append(
                                 {
                                     "type": decision_type,
                                     "feedback": (
@@ -926,16 +992,20 @@ class AgentServerACP(ACPAgent):
                         elif tool_name == "write_todos" and decision_type == "approve":
                             # Store the approved plan for future comparisons
                             self._session_plans[session_id] = tool_args.get("todos", [])
-                            user_decisions.append({"type": decision_type})
+                            interrupt_decisions.append({"type": decision_type})
                         else:
-                            user_decisions.append({"type": decision_type})
+                            interrupt_decisions.append({"type": decision_type})
                     else:
                         # User cancelled, treat as rejection
-                        user_decisions.append({"type": "reject"})
+                        interrupt_decisions.append({"type": "reject"})
 
                         # If cancelling a plan, clear it
                         if tool_name == "write_todos":
                             await self._clear_plan(session_id)
+
+                self.logger.on_interrupt_end(id=tool_call_id, output=interrupt_decisions)
+                user_decisions.extend(interrupt_decisions)
+
         return user_decisions
 
 
