@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 
@@ -11,7 +11,7 @@ class UsageDetail:
 
 
 class Logger:
-    def on_agent_start(
+    def on_request_start(
         self,
         id: str,
         name: Optional[str] = None,
@@ -21,7 +21,7 @@ class Logger:
     ) -> None:
         pass
 
-    def on_agent_end(
+    def on_request_end(
         self,
         id: str,
         name: Optional[str] = None,

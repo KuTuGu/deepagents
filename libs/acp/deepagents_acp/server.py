@@ -464,15 +464,6 @@ class AgentServerACP(ACPAgent):
                             "args": tool_args,
                         }
 
-                        if tool_name == "task":
-                            self.logger.on_agent_start(
-                                id=tool_id, name=tool_name, input=tool_args, metadata=_metadata
-                            )
-                        else:
-                            self.logger.on_tool_start(
-                                id=tool_id, name=tool_name, input=tool_args, metadata=_metadata
-                            )
-
                         # Create the appropriate tool call start
                         update = self._create_tool_call_start(tool_id, tool_name, tool_args)
 
@@ -640,21 +631,16 @@ class AgentServerACP(ACPAgent):
 
         current_state = None
         user_decisions = []
-        llm_output = ""
 
         message = {"messages": [{"role": "user", "content": content_blocks}]}
 
-        self.logger.on_agent_start(
-            id=session_id, name="user-request", input={"prompt": prompt, "message": message}
-        )
+        self.logger.on_request_start(id=session_id, name="user-request", input={"message": message})
 
         while current_state is None or current_state.interrupts:
             # Check for cancellation
             if self._cancelled:
                 self._cancelled = False  # Reset for next prompt
-                self.logger.on_agent_end(
-                    id=session_id, output=llm_output, metadata={"stop_reason": "cancelled"}
-                )
+                self.logger.on_request_end(id=session_id, metadata={"stop_reason": "cancelled"})
                 return PromptResponse(stop_reason="cancelled")
 
             async for stream_chunk in agent.astream(
@@ -672,9 +658,7 @@ class AgentServerACP(ACPAgent):
                 # Check for cancellation during streaming
                 if self._cancelled:
                     self._cancelled = False  # Reset for next prompt
-                    self.logger.on_agent_end(
-                        id=session_id, output=llm_output, metadata={"stop_reason": "cancelled"}
-                    )
+                    self.logger.on_request_end(id=session_id, metadata={"stop_reason": "cancelled"})
                     return PromptResponse(stop_reason="cancelled")
 
                 if stream_mode == "updates":
@@ -712,16 +696,24 @@ class AgentServerACP(ACPAgent):
 
                     for node_name, update in updates.items():
                         if node_name == "tools":
+                            for msg in update.get("messages", []):
+                                if isinstance(msg, ToolMessage):
+                                    self.logger.on_tool_end(
+                                        id=msg.tool_call_id,
+                                        output=msg.content,
+                                        metadata=msg,
+                                    )
+
                             if isinstance(update, dict) and "todos" in update:
                                 todos = update.get("todos", [])
                                 if todos:
                                     await self._handle_todo_update(
                                         session_id, todos, log_plan=False
                                     )
+
                         elif node_name == "model":
                             for msg in update.get("messages", []):
                                 if isinstance(msg, AIMessage):
-                                    llm_output += msg.content
                                     self.logger.on_llm(
                                         name=msg.name,
                                         model=msg.response_metadata.get("model_name"),
@@ -736,6 +728,15 @@ class AgentServerACP(ACPAgent):
                                             ).get("cache_read", 0),
                                         ),
                                     )
+
+                                    for tool_call in msg.tool_calls:
+                                        self.logger.on_tool_start(
+                                            id=tool_call["id"],
+                                            name=tool_call["name"],
+                                            input=tool_call["args"],
+                                            metadata=tool_call,
+                                        )
+
                         else:
                             self.logger.on_middleware(name=node_name, metadata=update)
 
@@ -780,11 +781,6 @@ class AgentServerACP(ACPAgent):
                         else:
                             formatted_content = str(content)
 
-                        if tool_name == "task":
-                            self.logger.on_agent_end(id=tool_call_id, output=str(content))
-                        else:
-                            self.logger.on_tool_end(id=tool_call_id, output=str(content))
-
                         update = update_tool_call(
                             tool_call_id=tool_call_id,
                             status="completed",
@@ -819,9 +815,7 @@ class AgentServerACP(ACPAgent):
             # Note: Interrupts are handled during streaming via __interrupt__ updates
             # This state check is only for the while loop condition
 
-        self.logger.on_agent_end(
-            id=session_id, output=llm_output, metadata={"stop_reason": "end_turn"}
-        )
+        self.logger.on_request_end(id=session_id, metadata={"stop_reason": "end_turn"})
 
         return PromptResponse(stop_reason="end_turn")
 
