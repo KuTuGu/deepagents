@@ -93,6 +93,7 @@ class AgentServerACP(ACPAgent):
         modes: SessionModeState | None = None,
         models: list[dict[str, str]] | None = None,
         logger: Logger | None = None,
+        workspace: str | None = None,
     ) -> None:
         """Initialize the ACP agent server with the given agent factory or compiled graph."""
         super().__init__()
@@ -100,6 +101,7 @@ class AgentServerACP(ACPAgent):
         self._agent_factory = agent
         self._agent: CompiledStateGraph | None = None
         self.logger = logger or Logger()
+        self.workspace = workspace
 
         if isinstance(agent, CompiledStateGraph):
             if modes is not None:
@@ -478,7 +480,9 @@ class AgentServerACP(ACPAgent):
                 content_blocks.extend(convert_audio_block_to_content_blocks(block))
             elif isinstance(block, ResourceContentBlock):
                 content_blocks.extend(
-                    convert_resource_block_to_content_blocks(block, root_dir=self._cwd)
+                    convert_resource_block_to_content_blocks(
+                        block, root_dir=self._cwd, workspace=self.workspace
+                    )
                 )
             elif isinstance(block, EmbeddedResourceContentBlock):
                 content_blocks.extend(convert_embedded_resource_block_to_content_blocks(block))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,7 @@ def convert_resource_block_to_content_blocks(
     block: ResourceContentBlock,
     *,
     root_dir: str,
+    workspace: str | None = None,
 ) -> list[dict[str, str]]:
     """Convert an ACP resource block to LangChain content blocks."""
     file_prefix = "file://"
@@ -60,7 +62,7 @@ def convert_resource_block_to_content_blocks(
             path = path[len(root_dir) :].lstrip("/")
 
         # Restore file:// prefix if it was present
-        uri = f"file://{path}" if has_file_prefix else path
+        uri = f"file://{os.path.join(workspace or '', path)}" if has_file_prefix else path
         resource_text += f"\nURI: {uri}"
     if block.description:
         resource_text += f"\nDescription: {block.description}"
